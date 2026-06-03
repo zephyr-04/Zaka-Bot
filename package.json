@@ -1,0 +1,24 @@
+{
+  "name": "zaka-bridge-bot",
+  "version": "1.0.0",
+  "description": "Zaka — Telegram cross-chain bridge powered by Across Protocol and Privy",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "dev": "nodemon src/bot.js"
+  },
+  "dependencies": {
+    "@privy-io/node": "^0.5.0",
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.0",
+    "ethers": "^6.13.0",
+    "json-canonicalize": "^2.0.0",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
