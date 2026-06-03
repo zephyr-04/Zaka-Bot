@@ -27,10 +27,10 @@ bot.onText(/\/start/, async (msg) => {
   const userId = msg.from.id;
   if (!limiter.check(userId)) return bot.sendMessage(chatId, "You're going too fast. Please wait a moment.");
 
-  sessions.clear(userId);
+  sessions.clearFlow(userId);
 
-  // Check if user already has a wallet
-  const existing = sessions.getWallet(userId);
+// Check if user already has a wallet
+const existing = sessions.getWallet(userId);
   if (existing) {
     return bot.sendMessage(chatId,
       `👋 Welcome back!\n\nYour wallet: \`${existing.walletAddress}\`\n\nUse /bridge to send tokens to another chain.`,
