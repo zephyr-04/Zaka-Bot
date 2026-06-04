@@ -3,11 +3,18 @@ const TelegramBot = require("node-telegram-bot-api");
 const { AcrossService } = require("./across");
 const { SessionManager } = require("./session");
 const { RateLimiter } = require("./rateLimiter");
-const { sanitizeAddress, sanitizeAmount, sanitizeChainId } = require("./validators");
+const { sanitizeAddress, sanitizeAmount } = require("./validators");
 const { SUPPORTED_CHAINS, SUPPORTED_TOKENS, BOT_CONFIG } = require("../config/constants");
 const { formatChainName } = require("./formatters");
 const { explorerLink } = require("./walletLinks");
 const { PrivyService } = require("./privy");
+const {
+  isPrivateChat,
+  validateEVMPrivateKey,
+  validateSolanaPrivateKey,
+  wipeKey,
+  deleteMessage,
+} = require("./security");
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 const across = new AcrossService();
@@ -20,53 +27,197 @@ const limiter = new RateLimiter({
   maxBridges: 3,
 });
 
-// ─── /start — Email onboarding ─────────────────────────────────────────────
+// ─── SECURITY: Block sensitive commands in group chats ─────────────────────
+
+const SENSITIVE_COMMANDS = ["/importwallet", "/exportwallet", "/start"];
+
+bot.on("message", async (msg) => {
+  const text = msg.text?.trim() || "";
+  const isSensitive = SENSITIVE_COMMANDS.some(cmd => text.startsWith(cmd));
+
+  if (isSensitive && !isPrivateChat(msg)) {
+    await bot.sendMessage(msg.chat.id,
+      "⚠️ For your security, wallet commands can only be used in private chats with Zaka.\n\nTap @ZakaBot to open a private chat."
+    );
+    return;
+  }
+});
+
+// ─── /start ────────────────────────────────────────────────────────────────
 
 bot.onText(/\/start/, async (msg) => {
+  if (!isPrivateChat(msg)) return;
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   if (!limiter.check(userId)) return bot.sendMessage(chatId, "You're going too fast. Please wait a moment.");
 
   sessions.clearFlow(userId);
 
-// Check if user already has a wallet
-const existing = sessions.getWallet(userId);
+  const existing = sessions.getWallet(userId);
   if (existing) {
     return bot.sendMessage(chatId,
-      `👋 Welcome back!\n\nYour wallet: \`${existing.walletAddress}\`\n\nUse /bridge to send tokens to another chain.`,
-      { parse_mode: "Markdown" }
+      `👋 *Welcome back!*\n\n` +
+      `Your wallet: \`${existing.walletAddress}\`\n\n` +
+      `What would you like to do?`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🔀 Bridge tokens", callback_data: "goto_bridge" }],
+            [{ text: "👛 View wallet & balance", callback_data: "goto_wallet" }],
+            [{ text: "📥 Import another wallet", callback_data: "goto_import" }],
+          ],
+        },
+      }
     );
   }
 
-  sessions.set(userId, { step: "AWAIT_EMAIL" });
+  sessions.setFlow(userId, { step: "AWAIT_EMAIL" });
 
   await bot.sendMessage(chatId,
     `🌉 *Welcome to Zaka*\n\n` +
-    `Zaka lets you send tokens from one blockchain to another — fast, cheap, and directly from Telegram.\n\n` +
-    `To get started, enter your *email address* below.\n\n` +
-    `We'll send you a quick verification code. No password needed.`,
+    `Zaka lets you bridge tokens across blockchains — fast, cheap, and directly from Telegram.\n\n` +
+    `To get started, enter your *email address* below. We'll send you a verification code.\n\n` +
+    `_Already have a wallet? Use /importwallet to bring it in._`,
     { parse_mode: "Markdown" }
   );
 });
 
-// ─── /wallet — Show current wallet ─────────────────────────────────────────
+// ─── /wallet ───────────────────────────────────────────────────────────────
 
 bot.onText(/\/wallet/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
-  const wallet = sessions.getWallet(userId);
+  if (!limiter.check(userId)) return;
 
+  const wallet = sessions.getWallet(userId);
   if (!wallet) {
-    return bot.sendMessage(chatId,
-      "You don't have a wallet set up yet. Use /start to create one."
+    return bot.sendMessage(chatId, "You don't have a wallet yet. Use /start to create one.");
+  }
+
+  await bot.sendMessage(chatId, "⏳ Fetching your balances...");
+
+  try {
+    const balances = await privyService.getEVMBalances(wallet.walletAddress);
+
+    let balanceText = "";
+    if (balances.length === 0) {
+      balanceText = "_No balances found. Fund your wallet to get started._";
+    } else {
+      balanceText = balances.map(b => `• *${b.symbol}* on ${b.chain}: \`${b.balance}\``).join("\n");
+    }
+
+    await bot.sendMessage(chatId,
+      `👛 *Your Wallet*\n\n` +
+      `Address: \`${wallet.walletAddress}\`\n\n` +
+      `*Balances:*\n${balanceText}\n\n` +
+      `_To receive tokens, share your address above._`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🔀 Bridge tokens", callback_data: "goto_bridge" }],
+            [{ text: "📤 Export wallet", callback_data: "goto_export" }],
+            [{ text: "📥 Import wallet", callback_data: "goto_import" }],
+          ],
+        },
+      }
     );
+  } catch (err) {
+    await bot.sendMessage(chatId,
+      `👛 *Your Wallet*\n\nAddress: \`${wallet.walletAddress}\`\n\n_Could not fetch balances right now. Try again shortly._`,
+      { parse_mode: "Markdown" }
+    );
+  }
+});
+
+// ─── /importwallet ─────────────────────────────────────────────────────────
+
+bot.onText(/\/importwallet/, async (msg) => {
+  if (!isPrivateChat(msg)) return;
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  if (!limiter.check(userId)) return;
+
+  sessions.clearFlow(userId);
+  sessions.setFlow(userId, { step: "AWAIT_IMPORT_TYPE" });
+
+  await bot.sendMessage(chatId,
+    `📥 *Import Wallet*\n\n` +
+    `Which type of wallet do you want to import?`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔷 EVM (MetaMask, Rabby, etc)", callback_data: "import_type:evm" }],
+          [{ text: "🟣 Solana (Phantom, Backpack, etc)", callback_data: "import_type:solana" }],
+          [{ text: "❌ Cancel", callback_data: "cancel" }],
+        ],
+      },
+    }
+  );
+});
+
+// ─── /exportwallet ─────────────────────────────────────────────────────────
+
+bot.onText(/\/exportwallet/, async (msg) => {
+  if (!isPrivateChat(msg)) return;
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  if (!limiter.check(userId)) return;
+
+  const wallet = sessions.getWallet(userId);
+  if (!wallet) {
+    return bot.sendMessage(chatId, "You don't have a wallet to export. Use /start to create one.");
+  }
+
+  if (!wallet.walletId) {
+    return bot.sendMessage(chatId, "This wallet cannot be exported. Only Zaka-created wallets support export.");
   }
 
   await bot.sendMessage(chatId,
-    `👛 *Your Wallet*\n\n` +
-    `Address: \`${wallet.walletAddress}\`\n\n` +
-    `_This is your Zaka wallet address. You can receive tokens here on any supported network._`,
-    { parse_mode: "Markdown" }
+    `⚠️ *Warning — Export Wallet*\n\n` +
+    `Your private key gives *complete access* to your funds.\n\n` +
+    `• Never share it with anyone\n` +
+    `• Store it somewhere safe and offline\n` +
+    `• Zaka will delete this message after 30 seconds\n\n` +
+    `Are you sure you want to export?`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "✅ Yes, export my key", callback_data: "confirm_export" }],
+          [{ text: "❌ Cancel", callback_data: "cancel" }],
+        ],
+      },
+    }
+  );
+});
+
+// ─── /removewallet ─────────────────────────────────────────────────────────
+
+bot.onText(/\/removewallet/, async (msg) => {
+  if (!isPrivateChat(msg)) return;
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+
+  const wallet = sessions.getWallet(userId);
+  if (!wallet) return bot.sendMessage(chatId, "No wallet to remove.");
+
+  await bot.sendMessage(chatId,
+    `⚠️ *Remove Wallet*\n\n` +
+    `This will disconnect \`${wallet.walletAddress}\` from Zaka.\n\n` +
+    `Your funds are safe — this only removes the connection. You can re-import anytime.\n\n` +
+    `Are you sure?`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "✅ Yes, remove it", callback_data: "confirm_remove_wallet" }],
+          [{ text: "❌ Cancel", callback_data: "cancel" }],
+        ],
+      },
+    }
   );
 });
 
@@ -76,17 +227,9 @@ bot.onText(/\/bridge/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
-  // Must have wallet first
   const wallet = sessions.getWallet(userId);
-  if (!wallet) {
-    return bot.sendMessage(chatId,
-      "You need to set up your wallet first. Use /start to get going."
-    );
-  }
-
-  if (!limiter.checkBridge(userId)) {
-    return bot.sendMessage(chatId, "You've made too many requests recently. Please wait a few minutes.");
-  }
+  if (!wallet) return bot.sendMessage(chatId, "You need a wallet first. Use /start to get going.");
+  if (!limiter.checkBridge(userId)) return bot.sendMessage(chatId, "Too many requests. Please wait a few minutes.");
 
   sessions.clearFlow(userId);
   sessions.setFlow(userId, { step: "SELECT_ORIGIN_CHAIN" });
@@ -107,153 +250,29 @@ bot.onText(/\/status/, async (msg) => {
   sessions.clearFlow(userId);
   sessions.setFlow(userId, { step: "AWAIT_STATUS_INPUT" });
   await bot.sendMessage(chatId,
-    `🔍 *Check Transfer Status*\n\n` +
-    `Paste your transaction hash and the network you sent from:\n\n` +
-    `Example: \`Ethereum 0x1234...abcd\`\n\n` +
-    `_Find your transaction hash in your wallet's activity tab._`,
+    `🔍 *Check Transfer Status*\n\nPaste your transaction hash and network:\n\nExample: \`Ethereum 0x1234...abcd\``,
     { parse_mode: "Markdown" }
   );
 });
 
-// ─── /balance ──────────────────────────────────────────────────────────────
-
-const { ethers } = require("ethers");
-
-const ERC20_ABI = [
-  "function balanceOf(address) view returns (uint256)",
-  "function decimals() view returns (uint8)",
-];
-
-const CHAIN_RPC = {
-  1:     process.env.RPC_ETHEREUM,
-  10:    process.env.RPC_OPTIMISM,
-  42161: process.env.RPC_ARBITRUM,
-  8453:  process.env.RPC_BASE,
-};
-
-async function getWalletBalances(walletAddress) {
-  const results = {};
-
-  await Promise.allSettled(
-    SUPPORTED_CHAINS.map(async (chain) => {
-      const rpc = CHAIN_RPC[chain.id];
-      if (!rpc) return;
-
-      const provider = new ethers.JsonRpcProvider(rpc);
-      const chainBalances = [];
-
-      try {
-        const raw = await provider.getBalance(walletAddress);
-        const balance = parseFloat(ethers.formatEther(raw)).toFixed(4);
-        chainBalances.push({ symbol: "ETH", balance });
-      } catch (_) {}
-
-      await Promise.allSettled(
-        SUPPORTED_TOKENS.map(async (token) => {
-          const tokenAddress = token.addresses?.[chain.id];
-          if (!tokenAddress) return;
-          try {
-            const contract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
-            const [raw, decimals] = await Promise.all([
-              contract.balanceOf(walletAddress),
-              contract.decimals(),
-            ]);
-            const balance = parseFloat(ethers.formatUnits(raw, decimals)).toFixed(2);
-            chainBalances.push({ symbol: token.symbol, balance });
-          } catch (_) {}
-        })
-      );
-
-      results[chain.name] = chainBalances;
-    })
-  );
-
-  return results;
-}
-
-bot.onText(/\/balance/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  if (!limiter.check(userId)) {
-    return bot.sendMessage(chatId, "Too many requests. Please slow down.");
-  }
-
-  const wallet = sessions.getWallet(userId);
-  if (!wallet) {
-    return bot.sendMessage(chatId,
-      "You don't have a wallet yet. Use /start to get set up."
-    );
-  }
-
-  await bot.sendMessage(chatId, "⏳ Fetching your balances...");
-
-  try {
-    const balances = await getWalletBalances(wallet.walletAddress);
-
-    const lines = [
-      `💰 *Wallet Balance*`,
-      `\`${wallet.walletAddress}\``,
-      ``,
-    ];
-
-    for (const [chainName, chainBalances] of Object.entries(balances)) {
-      const hasAny = chainBalances.some(b => parseFloat(b.balance) > 0);
-      if (!hasAny) continue;
-
-      lines.push(`*${chainName}*`);
-      for (const { symbol, balance } of chainBalances) {
-        if (parseFloat(balance) > 0) {
-          lines.push(`  • ${symbol}: ${balance}`);
-        }
-      }
-      lines.push(``);
-    }
-
-    if (lines.length === 3) {
-      lines.push(`_No balances found on supported networks._`);
-    }
-
-    lines.push(`_Updated ${new Date().toLocaleTimeString()}_`);
-
-    await bot.sendMessage(chatId, lines.join("\n"), { parse_mode: "Markdown" });
-  } catch (err) {
-    console.error("[balance error]", err.message);
-    await bot.sendMessage(chatId,
-      `⚠️ Couldn't fetch balances right now. Please try again.\n\n_${err.message}_`,
-      { parse_mode: "Markdown" }
-    );
-  }
-});
-
-// ─── /tokens ───────────────────────────────────────────────────────────────
+// ─── /tokens & /help ───────────────────────────────────────────────────────
 
 bot.onText(/\/tokens/, async (msg) => {
   const tokenList = SUPPORTED_TOKENS.map(t => `• *${t.symbol}* — ${t.name}`).join("\n");
-  await bot.sendMessage(msg.chat.id,
-    `🪙 *Supported Tokens*\n\n${tokenList}\n\n_More tokens coming soon._`,
-    { parse_mode: "Markdown" }
-  );
+  await bot.sendMessage(msg.chat.id, `🪙 *Supported Tokens*\n\n${tokenList}`, { parse_mode: "Markdown" });
 });
-
-// ─── /help ─────────────────────────────────────────────────────────────────
 
 bot.onText(/\/help/, async (msg) => {
   await bot.sendMessage(msg.chat.id,
     `❓ *How Zaka Works*\n\n` +
-    `*What does Zaka do?*\n` +
-    `Zaka moves your tokens from one blockchain to another — e.g. Ethereum to Arbitrum or Base to Optimism.\n\n` +
-    `*Do I need a wallet app?*\n` +
-    `No. Zaka creates a wallet for you using your email. No MetaMask, no seed phrases.\n\n` +
-    `*How do I get started?*\n` +
-    `Use /start, enter your email, verify with the code we send you. That's it — your wallet is ready.\n\n` +
-    `*How long do transfers take?*\n` +
-    `Most complete in 2–10 seconds.\n\n` +
+    `*Bridge tokens* across blockchains with /bridge\n` +
+    `*View wallet & balances* with /wallet\n` +
+    `*Import an existing wallet* with /importwallet\n` +
+    `*Export your wallet key* with /exportwallet\n` +
+    `*Remove wallet from Zaka* with /removewallet\n\n` +
     `*Is my money safe?*\n` +
-    `Yes. Zaka uses Privy's bank-grade wallet infrastructure. Your keys are secured in hardware enclaves — neither Zaka nor Privy can access your funds without your authorization.\n\n` +
-    `*Can I export my wallet?*\n` +
-    `Yes. Contact support to export your private key at any time.\n\n` +
-    `*Need help?* support@zaka.io`,
+    `Yes. Keys are secured in Privy's hardware enclaves (TEEs). Not even Privy can access them without your authorization.\n\n` +
+    `*Support:* https://discord.across.to`,
     { parse_mode: "Markdown" }
   );
 });
@@ -268,10 +287,83 @@ bot.on("callback_query", async (query) => {
   if (!limiter.check(userId)) return bot.answerCallbackQuery(query.id, { text: "Too many actions." });
   await bot.answerCallbackQuery(query.id);
 
-  const session = sessions.getFlow(userId);
-  if (!session) return bot.sendMessage(chatId, "Your session timed out. Please start again with /bridge.");
+  // ── Navigation shortcuts
+  if (data === "goto_bridge") return bot.sendMessage(chatId, "Use /bridge to start a transfer.");
+  if (data === "goto_wallet") return bot.sendMessage(chatId, "Use /wallet to view your wallet and balances.");
+  if (data === "goto_import") return bot.sendMessage(chatId, "Use /importwallet to import a wallet.");
+  if (data === "goto_export") return bot.sendMessage(chatId, "Use /exportwallet to export your wallet.");
 
-  // ── Select origin chain
+  // ── Import type selection
+  if (data === "import_type:evm") {
+    sessions.updateFlow(userId, { step: "AWAIT_EVM_KEY", importType: "evm" });
+    await bot.sendMessage(chatId,
+      `🔷 *Import EVM Wallet*\n\n` +
+      `⚠️ *Security notice:*\n` +
+      `• Make sure you are in a *private chat* with Zaka\n` +
+      `• Your message will be *deleted immediately*\n` +
+      `• Your key goes straight into a secure enclave — Zaka never stores it\n\n` +
+      `Paste your *private key* below (64 hex characters, with or without 0x):`,
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  else if (data === "import_type:solana") {
+    sessions.updateFlow(userId, { step: "AWAIT_SOLANA_KEY", importType: "solana" });
+    await bot.sendMessage(chatId,
+      `🟣 *Import Solana Wallet*\n\n` +
+      `⚠️ *Security notice:*\n` +
+      `• Make sure you are in a *private chat* with Zaka\n` +
+      `• Your message will be *deleted immediately*\n` +
+      `• Your key goes straight into a secure enclave\n\n` +
+      `Paste your *private key* below (base58 encoded):`,
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  // ── Export confirmation
+  else if (data === "confirm_export") {
+    const wallet = sessions.getWallet(userId);
+    if (!wallet?.walletId) return bot.sendMessage(chatId, "Wallet not found.");
+
+    await bot.sendMessage(chatId, "⏳ Retrieving your key from secure enclave...");
+
+    try {
+      const privateKey = await privyService.exportWallet(wallet.walletId);
+      if (!privateKey) throw new Error("Key not available.");
+
+      // Send key — this is the ONLY time it's ever shown
+      const keyMsg = await bot.sendMessage(chatId,
+        `🔑 *Your Private Key*\n\n` +
+        `\`${privateKey}\`\n\n` +
+        `⚠️ *Copy this now.* This message will be deleted in 30 seconds.\n` +
+        `Never share this with anyone.`,
+        { parse_mode: "Markdown" }
+      );
+
+      // Auto-delete after 30 seconds
+      setTimeout(async () => {
+        await deleteMessage(bot, chatId, keyMsg.message_id);
+        await bot.sendMessage(chatId, "🗑️ Your private key message has been deleted for security.");
+      }, 30_000);
+
+    } catch (err) {
+      await bot.sendMessage(chatId, `Could not export wallet: ${err.message}`);
+    }
+  }
+
+  // ── Remove wallet confirmation
+  else if (data === "confirm_remove_wallet") {
+    sessions.clearWallet(userId);
+    sessions.clearFlow(userId);
+    await bot.sendMessage(chatId,
+      `✅ Wallet removed from Zaka.\n\nYour funds are safe. Use /start or /importwallet anytime to reconnect.`
+    );
+  }
+
+  // ── Bridge flow
+  const session = sessions.getFlow(userId);
+  if (!session) return;
+
   if (data.startsWith("origin_chain:") && session.step === "SELECT_ORIGIN_CHAIN") {
     const chainId = parseInt(data.split(":")[1]);
     const chain = SUPPORTED_CHAINS.find(c => c.id === chainId);
@@ -300,20 +392,18 @@ bot.on("callback_query", async (query) => {
     const symbol = data.split(":")[1];
     sessions.updateFlow(userId, { token: symbol, step: "AWAIT_AMOUNT" });
     await bot.sendMessage(chatId,
-      `✅ Token: *${symbol}*\n\nStep 4 of 5 — How much do you want to send?\n\nType the number, e.g. \`10\` or \`0.5\`\n\n_Min: $${BOT_CONFIG.MIN_AMOUNT_USD} — Max: $${BOT_CONFIG.MAX_AMOUNT_USD}_`,
+      `✅ Token: *${symbol}*\n\nStep 4 of 5 — How much do you want to send?\n\nType the number e.g. \`10\` or \`0.5\`\n\n_Min: $${BOT_CONFIG.MIN_AMOUNT_USD} — Max: $${BOT_CONFIG.MAX_AMOUNT_USD}_`,
       { parse_mode: "Markdown" }
     );
   }
 
-  // ── Confirm bridge
   else if (data === "confirm_bridge" && session.step === "CONFIRM") {
     await executeBridge(chatId, userId, session);
   }
 
-  // ── Cancel
   else if (data === "cancel") {
     sessions.clearFlow(userId);
-    await bot.sendMessage(chatId, "Transfer cancelled. Tap /bridge whenever you're ready.");
+    await bot.sendMessage(chatId, "Cancelled. Use /bridge to start again.");
   }
 });
 
@@ -329,30 +419,121 @@ bot.on("message", async (msg) => {
   const session = sessions.getFlow(userId);
   if (!session) return;
 
-  // ── Email input
-  if (session.step === "AWAIT_EMAIL") {
-    const email = text.toLowerCase().trim();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+  // ── EVM private key input
+  if (session.step === "AWAIT_EVM_KEY") {
+    // Delete message immediately — before any processing
+    await deleteMessage(bot, chatId, msg.message_id);
+
+    if (!isPrivateChat(msg)) {
+      return bot.sendMessage(chatId, "⚠️ Private keys can only be submitted in private chats.");
+    }
+
+    let key = text;
+    const derivedAddress = validateEVMPrivateKey(key);
+
+    if (!derivedAddress) {
+      key = wipeKey(key);
+      sessions.clearFlow(userId);
       return bot.sendMessage(chatId,
-        "That doesn't look like a valid email address. Please try again."
+        "❌ That doesn't look like a valid EVM private key. It should be 64 hex characters.\n\nUse /importwallet to try again."
       );
     }
 
+    await bot.sendMessage(chatId, "⏳ Importing your wallet securely...");
+
+    try {
+      // Get or create Privy user for this Telegram ID
+      let privyUserId = sessions.getWallet(userId)?.privyUserId;
+      if (!privyUserId) {
+        privyUserId = await privyService.getUserOrCreate(userId);
+      }
+
+      const { walletId, walletAddress } = await privyService.importEVMWallet(key, privyUserId);
+      key = wipeKey(key); // Wipe immediately after use
+
+      sessions.storeWallet(userId, { privyUserId, walletAddress, walletId, type: "evm" });
+      sessions.clearFlow(userId);
+
+      await bot.sendMessage(chatId,
+        `✅ *EVM Wallet Imported!*\n\n` +
+        `Address: \`${walletAddress}\`\n\n` +
+        `Your wallet is now secured in Privy's hardware enclave. The private key has been wiped from memory.\n\n` +
+        `Use /bridge to start transferring tokens.`,
+        { parse_mode: "Markdown" }
+      );
+    } catch (err) {
+      key = wipeKey(key);
+      sessions.clearFlow(userId);
+      await bot.sendMessage(chatId, `❌ Import failed. Please check your key and try /importwallet again.`);
+    }
+    return;
+  }
+
+  // ── Solana private key input
+  if (session.step === "AWAIT_SOLANA_KEY") {
+    await deleteMessage(bot, chatId, msg.message_id);
+
+    if (!isPrivateChat(msg)) {
+      return bot.sendMessage(chatId, "⚠️ Private keys can only be submitted in private chats.");
+    }
+
+    let key = text;
+    const isValid = validateSolanaPrivateKey(key);
+
+    if (!isValid) {
+      key = wipeKey(key);
+      sessions.clearFlow(userId);
+      return bot.sendMessage(chatId,
+        "❌ That doesn't look like a valid Solana private key. It should be a base58 encoded string.\n\nUse /importwallet to try again."
+      );
+    }
+
+    await bot.sendMessage(chatId, "⏳ Importing your Solana wallet securely...");
+
+    try {
+      let privyUserId = sessions.getWallet(userId)?.privyUserId;
+      if (!privyUserId) {
+        privyUserId = await privyService.getUserOrCreate(userId);
+      }
+
+      const { walletId, walletAddress } = await privyService.importSolanaWallet(key, privyUserId);
+      key = wipeKey(key);
+
+      sessions.storeWallet(userId, { privyUserId, walletAddress, walletId, type: "solana" });
+      sessions.clearFlow(userId);
+
+      await bot.sendMessage(chatId,
+        `✅ *Solana Wallet Imported!*\n\n` +
+        `Address: \`${walletAddress}\`\n\n` +
+        `Your wallet is secured in Privy's hardware enclave.\n\n` +
+        `Use /bridge to start transferring tokens.`,
+        { parse_mode: "Markdown" }
+      );
+    } catch (err) {
+      key = wipeKey(key);
+      sessions.clearFlow(userId);
+      await bot.sendMessage(chatId, `❌ Import failed. Please check your key and try /importwallet again.`);
+    }
+    return;
+  }
+
+  // ── Email input
+  if (session.step === "AWAIT_EMAIL") {
+    const email = text.toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return bot.sendMessage(chatId, "That doesn't look like a valid email. Please try again.");
+    }
     sessions.updateFlow(userId, { email, step: "AWAIT_OTP" });
     await bot.sendMessage(chatId, "Sending your verification code...");
-
     try {
       await privyService.sendEmailOTP(email);
       await bot.sendMessage(chatId,
-        `📧 We sent a 6-digit code to *${email}*\n\nEnter it below to verify your account.`,
+        `📧 Code sent to *${email}*\n\nEnter the 6-digit code below:`,
         { parse_mode: "Markdown" }
       );
     } catch (err) {
       sessions.clearFlow(userId);
-      await bot.sendMessage(chatId,
-        `Couldn't send the code. Please check your email and try /start again.\n\n_${err.message}_`,
-        { parse_mode: "Markdown" }
-      );
+      await bot.sendMessage(chatId, `Couldn't send the code. Please try /start again.`);
     }
   }
 
@@ -360,37 +541,21 @@ bot.on("message", async (msg) => {
   else if (session.step === "AWAIT_OTP") {
     const code = text.replace(/\s/g, "");
     if (!/^\d{6}$/.test(code)) {
-      return bot.sendMessage(chatId,
-        "The code should be 6 digits. Please check your email and try again."
-      );
+      return bot.sendMessage(chatId, "The code should be 6 digits. Please check your email and try again.");
     }
-
     await bot.sendMessage(chatId, "Verifying...");
-
     try {
       const { privyUserId, walletAddress, walletId } = await privyService.verifyEmailOTP(session.email, code);
-
-sessions.storeWallet(userId, { privyUserId, walletAddress, walletId });
-sessions.clearFlow(userId);
-
-if (walletAddress) {
-  await bot.sendMessage(chatId,
-    `✅ *You're all set!*\n\n` +
-    `Your wallet has been created:\n\`${walletAddress}\`\n\n` +
-    `Ready to bridge? Use /bridge to send tokens to another chain.`,
-    { parse_mode: "Markdown" }
-  );
-} else {
-  await bot.sendMessage(chatId,
-    `✅ *Verified!*\n\n` +
-    `Your account is set up. Setting up your wallet now — use /wallet to check when it's ready.`,
-    { parse_mode: "Markdown" }
-  );
-}
-    } catch (err) {
+      sessions.storeWallet(userId, { privyUserId, walletAddress, walletId, type: "evm" });
+      sessions.clearFlow(userId);
       await bot.sendMessage(chatId,
-        `That code didn't work. Please check your email and try again, or use /start to resend.`
+        `✅ *You're all set!*\n\n` +
+        `Your wallet: \`${walletAddress}\`\n\n` +
+        `Use /bridge to send tokens, or /wallet to check your balances.`,
+        { parse_mode: "Markdown" }
       );
+    } catch (err) {
+      await bot.sendMessage(chatId, "That code didn't work. Please check your email and try again, or use /start to resend.");
     }
   }
 
@@ -398,12 +563,10 @@ if (walletAddress) {
   else if (session.step === "AWAIT_AMOUNT") {
     const amount = sanitizeAmount(text);
     if (!amount) return bot.sendMessage(chatId, "Please enter a valid number like `10` or `0.5`.", { parse_mode: "Markdown" });
-    if (parseFloat(amount) > BOT_CONFIG.MAX_AMOUNT_USD) {
-      return bot.sendMessage(chatId, `The maximum per transfer is $${BOT_CONFIG.MAX_AMOUNT_USD}. For larger amounts, contact support.`);
-    }
+    if (parseFloat(amount) > BOT_CONFIG.MAX_AMOUNT_USD) return bot.sendMessage(chatId, `Max transfer is $${BOT_CONFIG.MAX_AMOUNT_USD}.`);
     sessions.updateFlow(userId, { amount, step: "AWAIT_RECIPIENT" });
     await bot.sendMessage(chatId,
-      `✅ Amount: *${amount} ${session.token}*\n\nStep 5 of 5 — What wallet address should receive the tokens on *${formatChainName(session.destinationChainId)}*?\n\nPaste the receiving address (starts with \`0x\`).`,
+      `✅ Amount: *${amount} ${session.token}*\n\nStep 5 of 5 — Paste the *receiving address* on *${formatChainName(session.destinationChainId)}*:`,
       { parse_mode: "Markdown" }
     );
   }
@@ -411,56 +574,26 @@ if (walletAddress) {
   // ── Recipient input
   else if (session.step === "AWAIT_RECIPIENT") {
     const address = sanitizeAddress(text);
-    if (!address) {
-      return bot.sendMessage(chatId,
-        `That doesn't look like a valid wallet address. It should start with \`0x\` and be 42 characters long. Please try again.`,
-        { parse_mode: "Markdown" }
-      );
-    }
+    if (!address) return bot.sendMessage(chatId, "Invalid address. Should start with `0x` and be 42 characters.", { parse_mode: "Markdown" });
     sessions.updateFlow(userId, { recipient: address, step: "FETCHING_QUOTE" });
     await bot.sendMessage(chatId, "Getting your quote...");
     try {
       await fetchAndShowQuote(chatId, userId, { ...sessions.getFlow(userId) });
     } catch (err) {
       sessions.clearFlow(userId);
-      await bot.sendMessage(chatId,
-        `Something went wrong getting your quote. Please try /bridge again.\n\n_${err.message}_`,
-        { parse_mode: "Markdown" }
-      );
+      await bot.sendMessage(chatId, `Something went wrong. Please try /bridge again.`);
     }
   }
 
   // ── Status check
   else if (session.step === "AWAIT_STATUS_INPUT") {
     const parts = text.trim().split(/\s+/);
-    if (parts.length < 2) {
-      return bot.sendMessage(chatId,
-        `Please include both the network name and your transaction hash.\n\nExample: \`Ethereum 0x1234...abcd\``,
-        { parse_mode: "Markdown" }
-      );
-    }
-
-    const networkName = parts[0];
-    const txHash = parts[1];
-    const chain = SUPPORTED_CHAINS.find(c => c.name.toLowerCase() === networkName.toLowerCase());
-
-    if (!chain) {
-      return bot.sendMessage(chatId,
-        `Couldn't recognise that network. Supported: ${SUPPORTED_CHAINS.map(c => c.name).join(", ")}`
-      );
-    }
-
-    if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
-      return bot.sendMessage(chatId,
-        `That transaction hash doesn't look right. Find it in your wallet's activity tab.`
-      );
-    }
-
-    const link = explorerLink(txHash, chain.id);
-    await bot.sendMessage(chatId,
-      `📡 *Transfer Lookup*\n\nNetwork: *${chain.name}*\n[View on block explorer](${link})\n\n_If your tokens haven't arrived after 2 minutes, visit the Across Discord for support._`,
-      { parse_mode: "Markdown" }
-    );
+    if (parts.length < 2) return bot.sendMessage(chatId, "Include network and tx hash. Example: `Ethereum 0x1234...`", { parse_mode: "Markdown" });
+    const chain = SUPPORTED_CHAINS.find(c => c.name.toLowerCase() === parts[0].toLowerCase());
+    if (!chain) return bot.sendMessage(chatId, `Unknown network. Supported: ${SUPPORTED_CHAINS.map(c => c.name).join(", ")}`);
+    if (!/^0x[0-9a-fA-F]{64}$/.test(parts[1])) return bot.sendMessage(chatId, "That tx hash doesn't look right.");
+    const link = explorerLink(parts[1], chain.id);
+    await bot.sendMessage(chatId, `📡 *Transfer Lookup*\n\nNetwork: *${chain.name}*\n[View on block explorer](${link})`, { parse_mode: "Markdown" });
     sessions.clearFlow(userId);
   }
 });
@@ -469,19 +602,15 @@ if (walletAddress) {
 
 async function fetchAndShowQuote(chatId, userId, session) {
   const token = SUPPORTED_TOKENS.find(t => t.symbol === session.token);
-  if (!token) throw new Error("That token isn't supported yet.");
-
+  if (!token) throw new Error("Token not supported.");
   const inputToken = token.addresses[session.originChainId];
   const outputToken = token.addresses[session.destinationChainId];
-  if (!inputToken || !outputToken) {
-    throw new Error(`${session.token} isn't available on one of the selected networks.`);
-  }
+  if (!inputToken || !outputToken) throw new Error(`${session.token} not available on selected networks.`);
 
   const quote = await across.getQuote({
     originChainId: session.originChainId,
     destinationChainId: session.destinationChainId,
-    inputToken,
-    outputToken,
+    inputToken, outputToken,
     amount: session.amount,
     decimals: token.decimals,
     recipient: session.recipient,
@@ -489,18 +618,17 @@ async function fetchAndShowQuote(chatId, userId, session) {
 
   if (quote.isAmountTooLow) {
     sessions.clearFlow(userId);
-    return bot.sendMessage(chatId, "The amount is too small for this transfer. Please try a larger amount.");
+    return bot.sendMessage(chatId, "Amount too small. Please try a larger amount.");
   }
 
   sessions.updateFlow(userId, { quote, quoteTimestamp: Date.now(), step: "CONFIRM" });
 
   const feeText = quote.fees?.totalFeeAmount
     ? `~${parseFloat(quote.fees.totalFeeAmount).toFixed(6)} ${session.token}`
-    : "included in output amount";
+    : "included in output";
 
-  // Check if approval needed
   const approvalNote = quote.approvalTxns?.length > 0
-    ? `\n⚠️ _This token requires a one-time approval. Zaka will handle it automatically before sending._\n`
+    ? `\n⚠️ _One-time token approval required — Zaka handles it automatically._\n`
     : "";
 
   await bot.sendMessage(chatId,
@@ -514,16 +642,14 @@ async function fetchAndShowQuote(chatId, userId, session) {
     `Network fee: ${feeText}\n` +
     `Expected arrival: *${quote.estimatedFillTime}*\n` +
     `${approvalNote}\n` +
-    `Tap *Confirm* to send — Zaka will sign and submit the transaction for you.`,
+    `Tap *Confirm* to send:`,
     {
       parse_mode: "Markdown",
       reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "✅ Confirm Transfer", callback_data: "confirm_bridge" },
-            { text: "❌ Cancel", callback_data: "cancel" },
-          ],
-        ],
+        inline_keyboard: [[
+          { text: "✅ Confirm Transfer", callback_data: "confirm_bridge" },
+          { text: "❌ Cancel", callback_data: "cancel" },
+        ]],
       },
     }
   );
@@ -532,16 +658,21 @@ async function fetchAndShowQuote(chatId, userId, session) {
 // ─── EXECUTE BRIDGE ────────────────────────────────────────────────────────
 
 async function executeBridge(chatId, userId, session) {
-  // Quote expiry guard
   if (Date.now() - session.quoteTimestamp > BOT_CONFIG.QUOTE_EXPIRY_MS) {
     sessions.clearFlow(userId);
-    return bot.sendMessage(chatId, "Your quote expired. Please start a new transfer with /bridge.");
+    return bot.sendMessage(chatId, "Quote expired. Please start a new /bridge.");
   }
 
   const wallet = sessions.getWallet(userId);
   if (!wallet) {
     sessions.clearFlow(userId);
-    return bot.sendMessage(chatId, "Wallet not found. Please use /start to set up your wallet.");
+    return bot.sendMessage(chatId, "Wallet not found. Please use /start.");
+  }
+
+  const walletId = wallet.walletId;
+  if (!walletId) {
+    sessions.clearFlow(userId);
+    return bot.sendMessage(chatId, "Wallet not configured for signing. Please re-import with /importwallet.");
   }
 
   await bot.sendMessage(chatId, "⏳ Submitting your transfer...");
@@ -549,48 +680,33 @@ async function executeBridge(chatId, userId, session) {
   try {
     const { quote } = session;
 
-    // Get Privy wallet ID from user ID
-    const walletId = wallet.walletId;
-if (!walletId) throw new Error("Wallet not found. Please use /start to re-authenticate.");
-
-    // Handle approval tx first if needed
     if (quote.approvalTxns?.length > 0) {
       await bot.sendMessage(chatId, "Approving token spend...");
       const approvalTx = quote.approvalTxns[0];
       await privyService.sendTransaction(walletId, {
-        to: approvalTx.to,
-        data: approvalTx.data,
-        value: "0",
-        chainId: approvalTx.chainId,
+        to: approvalTx.to, data: approvalTx.data, value: "0", chainId: approvalTx.chainId,
       });
-      await bot.sendMessage(chatId, "✅ Approval done. Sending bridge transaction...");
+      await bot.sendMessage(chatId, "✅ Approved. Sending bridge transaction...");
     }
 
-    // Send bridge transaction
     const txHash = await privyService.sendTransaction(walletId, {
-      to: quote.toContract,
-      data: quote.calldata,
-      value: quote.value,
-      chainId: session.originChainId,
+      to: quote.toContract, data: quote.calldata, value: quote.value, chainId: session.originChainId,
     });
 
     const link = txHash ? explorerLink(txHash, session.originChainId) : null;
-
     sessions.clearFlow(userId);
 
     await bot.sendMessage(chatId,
       `✅ *Transfer submitted!*\n\n` +
-      `Your tokens are on their way to *${formatChainName(session.destinationChainId)}*.\n` +
-      `They should arrive in *${quote.estimatedFillTime}*.\n\n` +
+      `Heading to *${formatChainName(session.destinationChainId)}*.\n` +
+      `Expected arrival: *${quote.estimatedFillTime}*\n\n` +
       (link ? `[View transaction](${link})\n\n` : "") +
-      `Check your balance on ${formatChainName(session.destinationChainId)} to confirm arrival.`,
+      `Check /wallet to confirm arrival.`,
       { parse_mode: "Markdown" }
     );
   } catch (err) {
     sessions.clearFlow(userId);
-    await bot.sendMessage(chatId,
-      `❌ Transfer failed: ${err.message}\n\nPlease try /bridge again.`
-    );
+    await bot.sendMessage(chatId, `❌ Transfer failed. Please try /bridge again.`);
   }
 }
 
@@ -600,14 +716,15 @@ bot.on("polling_error", (err) => console.error("[polling error]", err.message));
 process.on("unhandledRejection", (reason) => console.error("[unhandled rejection]", reason));
 
 bot.setMyCommands([
-  { command: "start", description: "Set up your wallet" },
+  { command: "start", description: "Set up or access your wallet" },
   { command: "bridge", description: "Send tokens to another chain" },
-  { command: "wallet", description: "View your wallet address" },
-  { command: "status", description: "Check if your transfer arrived" },
-  { command: "balance", description: "Check your wallet balances" },
+  { command: "wallet", description: "View wallet address and balances" },
+  { command: "importwallet", description: "Import an existing wallet" },
+  { command: "exportwallet", description: "Export your private key" },
+  { command: "removewallet", description: "Disconnect wallet from Zaka" },
+  { command: "status", description: "Check a transfer status" },
   { command: "tokens", description: "See supported tokens" },
   { command: "help", description: "How Zaka works" },
-  
 ]);
 
 console.log("Zaka Bridge Bot is running...");
