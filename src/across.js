@@ -5,7 +5,7 @@ const { ethers } = require("ethers");
 
 const ACROSS_API = "https://app.across.to/api";
 
-const http = create({
+const http = axios.create({
   baseURL: ACROSS_API,
   timeout: 15_000,
   headers: {
@@ -17,17 +17,8 @@ const http = create({
 
 class AcrossService {
 
-  /**
-   * Fetch a bridge quote from Across Protocol.
-   *
-   * IMPORTANT:
-   *  - depositor = the wallet that is SENDING (Privy wallet address)
-   *  - recipient = the wallet that RECEIVES on destination chain (user-provided)
-   *  These must be different when sender != receiver.
-   */
   async getQuote({ originChainId, destinationChainId, inputToken, outputToken, amount, decimals, recipient, depositor }) {
     const amountWei = ethers.parseUnits(amount.toString(), decimals).toString();
-
     const params = {
       tradeType: "exactInput",
       amount: amountWei,
@@ -35,13 +26,11 @@ class AcrossService {
       outputToken,
       originChainId,
       destinationChainId,
-      depositor: depositor || recipient, // who is sending
-      recipient,                          // who receives on destination
+      depositor: depositor || recipient,
+      recipient,
       integratorId: process.env.ACROSS_INTEGRATOR_ID || "0x0000",
     };
-
     console.log("QUOTE PARAMS — depositor:", params.depositor, "recipient:", params.recipient);
-
     const { data } = await this._get("/swap/approval", params);
     return this._parseQuoteResponse(data, decimals, amount);
   }
@@ -68,8 +57,6 @@ class AcrossService {
     };
   }
 
-  // ─── PRIVATE ───────────────────────────────────────────────────────────────
-
   async _get(path, params = {}) {
     let attempt = 0;
     const delays = [500, 1500, 3000];
@@ -86,18 +73,14 @@ class AcrossService {
   }
 
   _parseQuoteResponse(data, decimals, inputAmount) {
-    // Across API v3 returns swapTx, not txs
     if (!data?.swapTx) {
       throw new Error(data?.message || "Invalid quote response from Across API.");
     }
-
     const bridge = data.steps?.bridge;
     const outputAmount = bridge?.outputAmount
       ? ethers.formatUnits(bridge.outputAmount.toString(), decimals)
       : "unknown";
-
     const fees = data.fees?.total;
-
     return {
       calldata: data.swapTx.data,
       toContract: data.swapTx.to,
@@ -137,4 +120,4 @@ class AcrossService {
   _sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 }
 
-export default { AcrossService };
+module.exports = { AcrossService };
