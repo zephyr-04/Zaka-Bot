@@ -1,7 +1,7 @@
 require("dotenv").config();
 
 const axios = require("axios");
-import { ethers } from "ethers";
+const { ethers } = require("ethers");
 
 const ACROSS_API = "https://app.across.to/api";
 
