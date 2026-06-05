@@ -1,22 +1,33 @@
-const axios = require("axios");
-const { ethers } = require("ethers");
+require("dotenv").config();
+
+import { create } from "axios";
+import { ethers } from "ethers";
 
 const ACROSS_API = "https://app.across.to/api";
-const ACROSS_TESTNET_API = "https://testnet.across.to/api";
 
-const http = axios.create({
-  baseURL: process.env.TESTNET === "true" ? ACROSS_TESTNET_API : ACROSS_API,
+const http = create({
+  baseURL: ACROSS_API,
   timeout: 15_000,
   headers: {
     "User-Agent": "ZakaBot/1.0",
     "Accept": "application/json",
-    "Authorization": `Bearer ${process.env.ACROSS_API_KEY }`,
+    "Authorization": `Bearer ${process.env.ACROSS_API_KEY}`,
   },
 });
 
 class AcrossService {
-  async getQuote({ originChainId, destinationChainId, inputToken, outputToken, amount, decimals, recipient }) {
+
+  /**
+   * Fetch a bridge quote from Across Protocol.
+   *
+   * IMPORTANT:
+   *  - depositor = the wallet that is SENDING (Privy wallet address)
+   *  - recipient = the wallet that RECEIVES on destination chain (user-provided)
+   *  These must be different when sender != receiver.
+   */
+  async getQuote({ originChainId, destinationChainId, inputToken, outputToken, amount, decimals, recipient, depositor }) {
     const amountWei = ethers.parseUnits(amount.toString(), decimals).toString();
+
     const params = {
       tradeType: "exactInput",
       amount: amountWei,
@@ -24,14 +35,14 @@ class AcrossService {
       outputToken,
       originChainId,
       destinationChainId,
-      depositor: recipient,
-      recipient,
+      depositor: depositor || recipient, // who is sending
+      recipient,                          // who receives on destination
       integratorId: process.env.ACROSS_INTEGRATOR_ID || "0x0000",
     };
 
-    console.log("SENDING PARAMS:", JSON.stringify(params, null, 2));
+    console.log("QUOTE PARAMS — depositor:", params.depositor, "recipient:", params.recipient);
+
     const { data } = await this._get("/swap/approval", params);
-    console.log("ACROSS API RESPONSE:", JSON.stringify(data, null, 2));
     return this._parseQuoteResponse(data, decimals, amount);
   }
 
@@ -57,6 +68,8 @@ class AcrossService {
     };
   }
 
+  // ─── PRIVATE ───────────────────────────────────────────────────────────────
+
   async _get(path, params = {}) {
     let attempt = 0;
     const delays = [500, 1500, 3000];
@@ -73,6 +86,7 @@ class AcrossService {
   }
 
   _parseQuoteResponse(data, decimals, inputAmount) {
+    // Across API v3 returns swapTx, not txs
     if (!data?.swapTx) {
       throw new Error(data?.message || "Invalid quote response from Across API.");
     }
@@ -100,14 +114,7 @@ class AcrossService {
           : null,
       },
       isAmountTooLow: false,
-      feeOnly: false,
     };
-  }
-
-  _parseFillTime(seconds) {
-    if (!seconds) return "2–10 seconds";
-    if (seconds < 60) return `~${seconds} seconds`;
-    return `~${Math.round(seconds / 60)} minutes`;
   }
 
   _bpsToPercent(bps) {
@@ -130,4 +137,4 @@ class AcrossService {
   _sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 }
 
-module.exports = { AcrossService };
+export default { AcrossService };

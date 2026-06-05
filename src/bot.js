@@ -1,6 +1,6 @@
 require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
-const { AcrossService } = require("./across");
+const { AcrossService } = require("./across").default;
 const { SessionManager } = require("./session");
 const { RateLimiter } = require("./rateLimiter");
 const { sanitizeAddress, sanitizeAmount } = require("./validators");
@@ -63,8 +63,8 @@ bot.onText(/\/start/, async (msg) => {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "🔀 Bridge tokens", callback_data: "goto_bridge" }],
-            [{ text: "👛 View wallet & balance", callback_data: "goto_wallet" }],
+            [{ text: " Bridge tokens", callback_data: "goto_bridge" }],
+            [{ text: " View wallet & balance", callback_data: "goto_wallet" }],
             [{ text: "📥 Import another wallet", callback_data: "goto_import" }],
           ],
         },
@@ -116,7 +116,7 @@ bot.onText(/\/wallet/, async (msg) => {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "🔀 Bridge tokens", callback_data: "goto_bridge" }],
+            [{ text: " Bridge tokens", callback_data: "goto_bridge" }],
             [{ text: "📤 Export wallet", callback_data: "goto_export" }],
             [{ text: "📥 Import wallet", callback_data: "goto_import" }],
           ],
@@ -125,7 +125,7 @@ bot.onText(/\/wallet/, async (msg) => {
     );
   } catch (err) {
     await bot.sendMessage(chatId,
-      `👛 *Your Wallet*\n\nAddress: \`${wallet.walletAddress}\`\n\n_Could not fetch balances right now. Try again shortly._`,
+      ` *Your Wallet*\n\nAddress: \`${wallet.walletAddress}\`\n\n_Could not fetch balances right now. Try again shortly._`,
       { parse_mode: "Markdown" }
     );
   }
@@ -149,9 +149,9 @@ bot.onText(/\/importwallet/, async (msg) => {
       parse_mode: "Markdown",
       reply_markup: {
         inline_keyboard: [
-          [{ text: "🔷 EVM (MetaMask, Rabby, etc)", callback_data: "import_type:evm" }],
-          [{ text: "🟣 Solana (Phantom, Backpack, etc)", callback_data: "import_type:solana" }],
-          [{ text: "❌ Cancel", callback_data: "cancel" }],
+          [{ text: " EVM (MetaMask, Rabby, etc)", callback_data: "import_type:evm" }],
+          [{ text: " Solana (Phantom, Backpack, etc)", callback_data: "import_type:solana" }],
+          [{ text: " Cancel", callback_data: "cancel" }],
         ],
       },
     }
@@ -607,14 +607,16 @@ async function fetchAndShowQuote(chatId, userId, session) {
   const outputToken = token.addresses[session.destinationChainId];
   if (!inputToken || !outputToken) throw new Error(`${session.token} not available on selected networks.`);
 
-  const quote = await across.getQuote({
-    originChainId: session.originChainId,
-    destinationChainId: session.destinationChainId,
-    inputToken, outputToken,
-    amount: session.amount,
-    decimals: token.decimals,
-    recipient: session.recipient,
-  });
+  const senderWallet = sessions.getWallet(userId);
+const quote = await across.getQuote({
+  originChainId: session.originChainId,
+  destinationChainId: session.destinationChainId,
+  inputToken, outputToken,
+  amount: session.amount,
+  decimals: token.decimals,
+  recipient: session.recipient,   // where tokens arrive
+  depositor: senderWallet?.walletAddress, // who is sending
+});
 
   if (quote.isAmountTooLow) {
     sessions.clearFlow(userId);
