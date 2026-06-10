@@ -1,6 +1,6 @@
 require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
-const { AcrossService } = require("./across").default;
+const { AcrossService } = require("./across");
 const { SessionManager } = require("./session");
 const { RateLimiter } = require("./rateLimiter");
 const { sanitizeAddress, sanitizeAmount } = require("./validators");
@@ -580,6 +580,7 @@ bot.on("message", async (msg) => {
     try {
       await fetchAndShowQuote(chatId, userId, { ...sessions.getFlow(userId) });
     } catch (err) {
+      console.log("QUOTE ERROR:", err.message, err.stack);
       sessions.clearFlow(userId);
       await bot.sendMessage(chatId, `Something went wrong. Please try /bridge again.`);
     }

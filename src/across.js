@@ -3,7 +3,8 @@ require("dotenv").config();
 const axios = require("axios");
 const { ethers } = require("ethers");
 
-const ACROSS_API = "https://app.across.to/api";
+const IS_TESTNET = process.env.TESTNET === "true";
+const ACROSS_API = IS_TESTNET ? "https://testnet.across.to/api" : "https://app.across.to/api";
 
 const http = axios.create({
   baseURL: ACROSS_API,
@@ -11,7 +12,7 @@ const http = axios.create({
   headers: {
     "User-Agent": "ZakaBot/1.0",
     "Accept": "application/json",
-    "Authorization": `Bearer ${process.env.ACROSS_API_KEY}`,
+    ...(IS_TESTNET ? {} : { "Authorization": `Bearer ${process.env.ACROSS_API_KEY}` }),
   },
 });
 
