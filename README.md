@@ -1,4 +1,4 @@
-# 🌉 Across Cross-Chain Bridge — Telegram Bot
+# 🌉 Across Cross-Chain Bridge a Telegram Bot
 
 A production-ready Telegram bot that lets users bridge EVM tokens across chains using [Across Protocol](https://across.to) — the fastest intent-based cross-chain bridge.
 
