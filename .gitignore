@@ -2,5 +2,6 @@ node_modules/
 .env
 privy_private.pem
 privy_public.pem
+*.pem
 
 data/
